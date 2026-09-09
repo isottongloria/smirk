@@ -44,6 +44,11 @@ if __name__ == '__main__':
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
+    parser.add_argument('--face-detection-mode', type=str, default='direct', choices=['direct', 'pose_roi'],
+                         help="'direct' (default): run MediaPipe FaceLandmarker on the full frame, as in the "
+                              "original SMIRK release. 'pose_roi': locate the face with MediaPipe Pose first, "
+                              "then run FaceLandmarker on a zoomed-in crop; more robust when the face is small "
+                              "or far from the camera.")
 
     args = parser.parse_args()
 
@@ -78,7 +83,7 @@ if __name__ == '__main__':
     image = cv2.imread(args.input_path)
     orig_image_height, orig_image_width, _ = image.shape
 
-    kpt_mediapipe = run_mediapipe(image)
+    kpt_mediapipe = run_mediapipe(image, face_detection_mode=args.face_detection_mode)
 
     # crop face if needed
     if args.crop:

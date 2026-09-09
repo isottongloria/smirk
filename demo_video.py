@@ -8,7 +8,7 @@ from src.renderer.renderer import Renderer
 import argparse
 import os
 import src.utils.masking as masking_utils
-from utils.mediapipe_utils import run_mediapipe
+from utils.mediapipe_utils import run_mediapipe, run_mediapipe_pose_roi_video
 from datasets.base_dataset import create_mask
 import torch.nn.functional as F
 
@@ -34,6 +34,117 @@ def crop_face(frame, landmarks, scale=1.0, image_size=224):
     return tform
 
 
+def process_frame(image, kpt_mediapipe, args, models, video_height, video_width, input_image_size):
+    """Run SMIRK inference for one frame and return the BGR grid image to write to the
+    output video, given already-extracted 478x3 mediapipe landmarks (or None)."""
+    smirk_encoder = models['smirk_encoder']
+    flame = models['flame']
+    renderer = models['renderer']
+    smirk_generator = models.get('smirk_generator')
+    face_probabilities = models.get('face_probabilities')
+
+    # crop face if needed
+    if args.crop:
+        if kpt_mediapipe is None:
+            print('Could not find landmarks for the image using mediapipe and cannot crop the face. Exiting...')
+            exit()
+
+        kpt_mediapipe_2d = kpt_mediapipe[..., :2]
+
+        tform = crop_face(image, kpt_mediapipe_2d, scale=1.4, image_size=input_image_size)
+
+        cropped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True).astype(np.uint8)
+
+        cropped_kpt_mediapipe = np.dot(tform.params, np.hstack([kpt_mediapipe_2d, np.ones([kpt_mediapipe_2d.shape[0], 1])]).T).T
+        cropped_kpt_mediapipe = cropped_kpt_mediapipe[:, :2]
+    else:
+        tform = None
+        cropped_image = image
+        cropped_kpt_mediapipe = kpt_mediapipe
+
+    cropped_image_tensor = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
+    cropped_image_tensor = cv2.resize(cropped_image_tensor, (224, 224))
+    cropped_image_tensor = torch.tensor(cropped_image_tensor).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    cropped_image_tensor = cropped_image_tensor.to(args.device)
+
+    outputs = smirk_encoder(cropped_image_tensor)
+
+    flame_output = flame.forward(outputs)
+    renderer_output = renderer.forward(flame_output['vertices'], outputs['cam'],
+                                        landmarks_fan=flame_output['landmarks_fan'], landmarks_mp=flame_output['landmarks_mp'])
+
+    rendered_img = renderer_output['rendered_img']
+
+    if args.render_orig:
+        if args.crop:
+            rendered_img_numpy = (rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
+            rendered_img_orig = warp(rendered_img_numpy, tform, output_shape=(video_height, video_width), preserve_range=True).astype(np.uint8)
+            # back to pytorch to concatenate with full_image
+            rendered_img_orig = torch.Tensor(rendered_img_orig).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        else:
+            rendered_img_orig = F.interpolate(rendered_img, (video_height, video_width), mode='bilinear').cpu()
+
+        full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        grid = torch.cat([full_image, rendered_img_orig], dim=3)
+    else:
+        grid = torch.cat([cropped_image_tensor, rendered_img], dim=3)
+
+    # ---- create the neural renderer reconstructed img ---- #
+    if args.use_smirk_generator:
+        if kpt_mediapipe is None:
+            print('Could not find landmarks for the image using mediapipe and cannot create the hull mask for the smirk generator. Exiting...')
+            exit()
+
+        mask_ratio_mul = 5
+        mask_ratio = 0.01
+        mask_dilation_radius = 10
+
+        hull_mask = create_mask(cropped_kpt_mediapipe, (224, 224))
+
+        rendered_mask = 1 - (rendered_img == 0).all(dim=1, keepdim=True).float()
+        tmask_ratio = mask_ratio * mask_ratio_mul  # upper bound on the number of points to sample
+
+        npoints, _ = masking_utils.mesh_based_mask_uniform_faces(renderer_output['transformed_vertices'],  # sample uniformly from the mesh
+                                                                   flame_faces=flame.faces_tensor,
+                                                                   face_probabilities=face_probabilities,
+                                                                   mask_ratio=tmask_ratio)
+
+        pmask = torch.zeros_like(rendered_mask)
+        rsing = torch.randint(0, 2, (npoints.size(0),)).to(npoints.device) * 2 - 1
+        rscale = torch.rand((npoints.size(0),)).to(npoints.device) * (mask_ratio_mul - 1) + 1
+        rbound = (npoints.size(1) * (1 / mask_ratio_mul) * (rscale ** rsing)).long()
+
+        for bi in range(npoints.size(0)):
+            pmask[bi, :, npoints[bi, :rbound[bi], 1], npoints[bi, :rbound[bi], 0]] = 1
+
+        hull_mask_tensor = torch.from_numpy(hull_mask).type(dtype=torch.float32).unsqueeze(0).to(args.device)
+
+        extra_points = cropped_image_tensor * pmask
+        masked_img = masking_utils.masking(cropped_image_tensor, hull_mask_tensor, extra_points, mask_dilation_radius, rendered_mask=rendered_mask)
+
+        smirk_generator_input = torch.cat([rendered_img, masked_img], dim=1)
+
+        reconstructed_img = smirk_generator(smirk_generator_input)
+
+        if args.render_orig:
+            if args.crop:
+                reconstructed_img_numpy = (reconstructed_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
+                reconstructed_img_orig = warp(reconstructed_img_numpy, tform, output_shape=(video_height, video_width), preserve_range=True).astype(np.uint8)
+                # back to pytorch to concatenate with full_image
+                reconstructed_img_orig = torch.Tensor(reconstructed_img_orig).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            else:
+                reconstructed_img_orig = F.interpolate(reconstructed_img, (video_height, video_width), mode='bilinear').cpu()
+
+            grid = torch.cat([grid, reconstructed_img_orig], dim=3)
+        else:
+            grid = torch.cat([grid, reconstructed_img], dim=3)
+
+    grid_numpy = grid.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0
+    grid_numpy = grid_numpy.astype(np.uint8)
+    grid_numpy = cv2.cvtColor(grid_numpy, cv2.COLOR_BGR2RGB)
+    return grid_numpy
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
@@ -44,37 +155,51 @@ if __name__ == '__main__':
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
+    parser.add_argument('--face-detection-mode', type=str, default='direct', choices=['direct', 'pose_roi'],
+                         help="'direct' (default): run MediaPipe FaceLandmarker independently on every frame, as "
+                              "in the original SMIRK release; a single frame with no detected face stops the demo. "
+                              "'pose_roi': track the face across the whole video with MediaPipe Pose first, then "
+                              "run FaceLandmarker on a zoomed-in crop per frame; landmarks for frames where "
+                              "detection fails are interpolated from neighboring frames, so the demo always "
+                              "completes and stays temporally aligned with the video.")
 
     args = parser.parse_args()
 
     input_image_size = 224
-    
 
     # ----------------------- initialize configuration ----------------------- #
     smirk_encoder = SmirkEncoder().to(args.device)
     checkpoint = torch.load(args.checkpoint)
-    checkpoint_encoder = {k.replace('smirk_encoder.', ''): v for k, v in checkpoint.items() if 'smirk_encoder' in k} # checkpoint includes both smirk_encoder and smirk_generator
+    checkpoint_encoder = {k.replace('smirk_encoder.', ''): v for k, v in checkpoint.items() if 'smirk_encoder' in k}  # checkpoint includes both smirk_encoder and smirk_generator
 
     smirk_encoder.load_state_dict(checkpoint_encoder)
     smirk_encoder.eval()
 
+    smirk_generator = None
+    face_probabilities = None
     if args.use_smirk_generator:
         from src.smirk_generator import SmirkGenerator
         smirk_generator = SmirkGenerator(in_channels=6, out_channels=3, init_features=32, res_blocks=5).to(args.device)
 
-        checkpoint_generator = {k.replace('smirk_generator.', ''): v for k, v in checkpoint.items() if 'smirk_generator' in k} # checkpoint includes both smirk_encoder and smirk_generator
+        checkpoint_generator = {k.replace('smirk_generator.', ''): v for k, v in checkpoint.items() if 'smirk_generator' in k}  # checkpoint includes both smirk_encoder and smirk_generator
         smirk_generator.load_state_dict(checkpoint_generator)
         smirk_generator.eval()
 
         # load also triangle probabilities for sampling points on the image
-        face_probabilities = masking_utils.load_probabilities_per_FLAME_triangle()  
-
+        face_probabilities = masking_utils.load_probabilities_per_FLAME_triangle()
 
     # ---- visualize the results ---- #
 
     flame = FLAME().to(args.device)
     renderer = Renderer().to(args.device)
 
+    models = {
+        'smirk_encoder': smirk_encoder,
+        'flame': flame,
+        'renderer': renderer,
+        'smirk_generator': smirk_generator,
+        'face_probabilities': face_probabilities,
+    }
 
     cap = cv2.VideoCapture(args.input_path)
 
@@ -104,116 +229,44 @@ if __name__ == '__main__':
 
     cap_out = cv2.VideoWriter(f"{args.out_path}/{args.input_path.split('/')[-1].split('.')[0]}.mp4", cv2.VideoWriter_fourcc(*'mp4v'), video_fps, (out_width, out_height))
 
-    while True:
-        ret, image = cap.read()
+    if args.face_detection_mode == 'pose_roi':
+        # Decode the whole video up front so landmark extraction (with MediaPipe Pose
+        # tracking across all frames) happens before SMIRK inference, and a single missing
+        # detection can no longer abort the demo.
+        frames = []
+        while True:
+            ret, image = cap.read()
+            if not ret:
+                break
+            frames.append(image)
+        cap.release()
 
-        if not ret:
-            break
-    
-        kpt_mediapipe = run_mediapipe(image)
+        pose_roi_result = run_mediapipe_pose_roi_video(frames, progress=True)
+        landmarks_sequence = pose_roi_result['landmarks']
 
-        # crop face if needed
-        if args.crop:
-            if (kpt_mediapipe is None):
-                print('Could not find landmarks for the image using mediapipe and cannot crop the face. Exiting...')
-                exit()
-            
-            kpt_mediapipe = kpt_mediapipe[..., :2]
+        print(
+            f"[pose_roi] frames={pose_roi_result['frame_count']} "
+            f"pose_roi_real={pose_roi_result['pose_roi_real']} "
+            f"pose_roi_interpolated={pose_roi_result['pose_roi_interpolated']} "
+            f"face_real={pose_roi_result['face_real']} "
+            f"face_interpolated={pose_roi_result['face_interpolated']}"
+        )
 
-            tform = crop_face(image,kpt_mediapipe,scale=1.4,image_size=input_image_size)
-            
-            cropped_image = warp(image, tform.inverse, output_shape=(224, 224), preserve_range=True).astype(np.uint8)
+        for t, image in enumerate(frames):
+            grid_numpy = process_frame(image, landmarks_sequence[t], args, models, video_height, video_width, input_image_size)
+            cap_out.write(grid_numpy)
+    else:
+        while True:
+            ret, image = cap.read()
 
-            cropped_kpt_mediapipe = np.dot(tform.params, np.hstack([kpt_mediapipe, np.ones([kpt_mediapipe.shape[0],1])]).T).T
-            cropped_kpt_mediapipe = cropped_kpt_mediapipe[:,:2]
-        else:
-            cropped_image = image
-            cropped_kpt_mediapipe = kpt_mediapipe
+            if not ret:
+                break
 
-        
-        cropped_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
-        cropped_image = cv2.resize(cropped_image, (224,224))
-        cropped_image = torch.tensor(cropped_image).permute(2,0,1).unsqueeze(0).float()/255.0
-        cropped_image = cropped_image.to(args.device)
+            kpt_mediapipe = run_mediapipe(image, face_detection_mode='direct')
 
-        outputs = smirk_encoder(cropped_image)
+            grid_numpy = process_frame(image, kpt_mediapipe, args, models, video_height, video_width, input_image_size)
+            cap_out.write(grid_numpy)
 
-        flame_output = flame.forward(outputs)
-        renderer_output = renderer.forward(flame_output['vertices'], outputs['cam'],
-                                            landmarks_fan=flame_output['landmarks_fan'], landmarks_mp=flame_output['landmarks_mp'])
-        
-        rendered_img = renderer_output['rendered_img']
+        cap.release()
 
-        if args.render_orig:
-            if args.crop:
-                rendered_img_numpy = (rendered_img.squeeze(0).permute(1,2,0).detach().cpu().numpy()*255.0).astype(np.uint8)               
-                rendered_img_orig = warp(rendered_img_numpy, tform, output_shape=(video_height, video_width), preserve_range=True).astype(np.uint8)
-                # back to pytorch to concatenate with full_image
-                rendered_img_orig = torch.Tensor(rendered_img_orig).permute(2,0,1).unsqueeze(0).float()/255.0
-            else:
-                rendered_img_orig = F.interpolate(rendered_img, (video_height, video_width), mode='bilinear').cpu()
-
-            full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2,0,1).unsqueeze(0).float()/255.0
-            grid = torch.cat([full_image, rendered_img_orig], dim=3)
-        else:
-            grid = torch.cat([cropped_image, rendered_img], dim=3)
-
-        # ---- create the neural renderer reconstructed img ---- #
-        if args.use_smirk_generator:
-            if (kpt_mediapipe is None):
-                print('Could not find landmarks for the image using mediapipe and cannot create the hull mask for the smirk generator. Exiting...')
-                exit()
-
-            mask_ratio_mul = 5
-            mask_ratio = 0.01
-            mask_dilation_radius = 10
-
-            hull_mask = create_mask(cropped_kpt_mediapipe, (224, 224))
-
-            rendered_mask = 1 - (rendered_img == 0).all(dim=1, keepdim=True).float()
-            tmask_ratio = mask_ratio * mask_ratio_mul # upper bound on the number of points to sample
-            
-            npoints, _ = masking_utils.mesh_based_mask_uniform_faces(renderer_output['transformed_vertices'], # sample uniformly from the mesh
-                                                                    flame_faces=flame.faces_tensor,
-                                                                    face_probabilities=face_probabilities,
-                                                                    mask_ratio=tmask_ratio)
-            
-            pmask = torch.zeros_like(rendered_mask)                
-            rsing = torch.randint(0, 2, (npoints.size(0),)).to(npoints.device) * 2 - 1
-            rscale = torch.rand((npoints.size(0),)).to(npoints.device) * (mask_ratio_mul - 1) + 1
-            rbound =(npoints.size(1) * (1/mask_ratio_mul) * (rscale ** rsing)).long()
-
-            for bi in range(npoints.size(0)):
-                pmask[bi, :, npoints[bi, :rbound[bi], 1], npoints[bi, :rbound[bi], 0]] = 1
-            
-            hull_mask = torch.from_numpy(hull_mask).type(dtype = torch.float32).unsqueeze(0).to(args.device)
-
-            extra_points = cropped_image * pmask
-            masked_img = masking_utils.masking(cropped_image, hull_mask, extra_points, mask_dilation_radius, rendered_mask=rendered_mask)
-
-            smirk_generator_input = torch.cat([rendered_img, masked_img], dim=1)
-
-            reconstructed_img = smirk_generator(smirk_generator_input)
-
-            if args.render_orig:
-                if args.crop:
-                    reconstructed_img_numpy = (reconstructed_img.squeeze(0).permute(1,2,0).detach().cpu().numpy()*255.0).astype(np.uint8)               
-                    reconstructed_img_orig = warp(reconstructed_img_numpy, tform, output_shape=(video_height, video_width), preserve_range=True).astype(np.uint8)
-                    # back to pytorch to concatenate with full_image
-                    reconstructed_img_orig = torch.Tensor(reconstructed_img_orig).permute(2,0,1).unsqueeze(0).float()/255.0
-                else:
-                    reconstructed_img_orig = F.interpolate(reconstructed_img, (video_height, video_width), mode='bilinear').cpu()
-
-                grid = torch.cat([grid, reconstructed_img_orig], dim=3)
-            else:
-                grid = torch.cat([grid, reconstructed_img], dim=3)
-
-        grid_numpy = grid.squeeze(0).permute(1,2,0).detach().cpu().numpy()*255.0
-        grid_numpy = grid_numpy.astype(np.uint8)
-        grid_numpy = cv2.cvtColor(grid_numpy, cv2.COLOR_BGR2RGB)
-        cap_out.write(grid_numpy)
-
-    cap.release()
     cap_out.release()
-
-
