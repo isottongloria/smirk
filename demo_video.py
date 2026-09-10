@@ -85,9 +85,19 @@ def process_frame(image, kpt_mediapipe, args, models, video_height, video_width,
             rendered_img_orig = F.interpolate(rendered_img, (video_height, video_width), mode='bilinear').cpu()
 
         full_image = torch.Tensor(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        grid = torch.cat([full_image, rendered_img_orig], dim=3)
+        if args.visualization_layout == 'overlay':
+            render_mask = (rendered_img_orig != 0).any(dim=1, keepdim=True)
+            blended = (1.0 - args.overlay_alpha) * full_image + args.overlay_alpha * rendered_img_orig
+            grid = torch.where(render_mask, blended, full_image)
+        else:
+            grid = torch.cat([full_image, rendered_img_orig], dim=3)
     else:
-        grid = torch.cat([cropped_image_tensor, rendered_img], dim=3)
+        if args.visualization_layout == 'overlay':
+            render_mask = (rendered_img != 0).any(dim=1, keepdim=True)
+            blended = (1.0 - args.overlay_alpha) * cropped_image_tensor + args.overlay_alpha * rendered_img
+            grid = torch.where(render_mask, blended, cropped_image_tensor)
+        else:
+            grid = torch.cat([cropped_image_tensor, rendered_img], dim=3)
 
     # ---- create the neural renderer reconstructed img ---- #
     if args.use_smirk_generator:
@@ -155,6 +165,12 @@ if __name__ == '__main__':
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
     parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
+    parser.add_argument('--visualization-layout', choices=['side_by_side', 'overlay'], default='side_by_side',
+                        help="Display input and rendering side by side (default), or blend the rendering over the input")
+    parser.add_argument('--overlay-alpha', type=float, default=0.55,
+                        help='Rendering opacity for --visualization-layout overlay (between 0 and 1)')
+    parser.add_argument('--output-name', type=str,
+                        help='Output filename without extension (default: input video basename)')
     parser.add_argument('--face-detection-mode', type=str, default='direct', choices=['direct', 'pose_roi'],
                          help="'direct' (default): run MediaPipe FaceLandmarker independently on every frame, as "
                               "in the original SMIRK release; a single frame with no detected face stops the demo. "
@@ -164,6 +180,13 @@ if __name__ == '__main__':
                               "completes and stays temporally aligned with the video.")
 
     args = parser.parse_args()
+
+    if not 0.0 <= args.overlay_alpha <= 1.0:
+        parser.error('--overlay-alpha must be between 0 and 1')
+    if args.visualization_layout == 'overlay' and args.use_smirk_generator:
+        parser.error('--use_smirk_generator is not displayed by the overlay layout; omit it or use side_by_side')
+    if args.output_name is not None and (not args.output_name or os.path.basename(args.output_name) != args.output_name):
+        parser.error('--output-name must be a non-empty filename, not a path')
 
     input_image_size = 224
 
@@ -219,15 +242,17 @@ if __name__ == '__main__':
         out_width = input_image_size
         out_height = input_image_size
 
-    if args.use_smirk_generator:
+    if args.use_smirk_generator and args.visualization_layout != 'overlay':
         out_width *= 3
-    else:
+    elif args.visualization_layout != 'overlay':
         out_width *= 2
 
     if not os.path.exists(args.out_path):
         os.makedirs(args.out_path)
 
-    cap_out = cv2.VideoWriter(f"{args.out_path}/{args.input_path.split('/')[-1].split('.')[0]}.mp4", cv2.VideoWriter_fourcc(*'mp4v'), video_fps, (out_width, out_height))
+    # Preserve the original naming convention when --output-name is omitted.
+    output_name = args.output_name or os.path.basename(args.input_path).split('.')[0]
+    cap_out = cv2.VideoWriter(os.path.join(args.out_path, f"{output_name}.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), video_fps, (out_width, out_height))
 
     if args.face_detection_mode == 'pose_roi':
         # Decode the whole video up front so landmark extraction (with MediaPipe Pose
