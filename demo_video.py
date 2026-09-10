@@ -11,6 +11,11 @@ import src.utils.masking as masking_utils
 from utils.mediapipe_utils import run_mediapipe, run_mediapipe_pose_roi_video
 from datasets.base_dataset import create_mask
 import torch.nn.functional as F
+from utils.video_visualization import (
+    compose_overlay_layout,
+    compose_render_overlay,  # re-exported here as part of the demo's testable API
+    rgb_to_opencv_bgr,
+)
 
 
 def crop_face(frame, landmarks, scale=1.0, image_size=224):
@@ -74,6 +79,38 @@ def process_frame(image, kpt_mediapipe, args, models, video_height, video_width,
                                         landmarks_fan=flame_output['landmarks_fan'], landmarks_mp=flame_output['landmarks_mp'])
 
     rendered_img = renderer_output['rendered_img']
+
+    if args.visualization_layout == 'overlay':
+        rendered_rgb = np.clip(
+            rendered_img.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0,
+            0, 255).astype(np.uint8)
+        rendered_mask = (rendered_rgb != 0).any(axis=2)
+
+        if args.render_orig:
+            original_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if args.crop:
+                rendered_rgb = warp(rendered_rgb, tform,
+                                    output_shape=(video_height, video_width),
+                                    preserve_range=True).astype(np.uint8)
+                # Warp the native valid-pixel mask separately.  Nearest-neighbor
+                # interpolation prevents a soft halo from treating black as mesh.
+                rendered_mask = warp(rendered_mask.astype(np.uint8), tform,
+                                     output_shape=(video_height, video_width), order=0,
+                                     preserve_range=True).astype(bool)
+            else:
+                rendered_rgb = cv2.resize(rendered_rgb, (video_width, video_height),
+                                          interpolation=cv2.INTER_LINEAR)
+                rendered_mask = cv2.resize(rendered_mask.astype(np.uint8),
+                                           (video_width, video_height),
+                                           interpolation=cv2.INTER_NEAREST).astype(bool)
+            rendered_rgb[~rendered_mask] = 0
+        else:
+            original_rgb = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB)
+            original_rgb = cv2.resize(original_rgb, (input_image_size, input_image_size))
+
+        overlay_grid_rgb = compose_overlay_layout(
+            original_rgb, rendered_rgb, rendered_mask,
+            alpha=args.overlay_alpha, color=args.overlay_color)
 
     if args.render_orig:
         if args.crop:
@@ -139,6 +176,11 @@ def process_frame(image, kpt_mediapipe, args, models, video_height, video_width,
         else:
             grid = torch.cat([grid, reconstructed_img], dim=3)
 
+    if args.visualization_layout == 'overlay':
+        # The neural generator is deliberately still evaluated above when
+        # requested, but its reconstruction is not part of this fixed layout.
+        return rgb_to_opencv_bgr(overlay_grid_rgb)
+
     grid_numpy = grid.squeeze(0).permute(1, 2, 0).detach().cpu().numpy() * 255.0
     grid_numpy = grid_numpy.astype(np.uint8)
     grid_numpy = cv2.cvtColor(grid_numpy, cv2.COLOR_BGR2RGB)
@@ -153,8 +195,18 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='trained_models/SMIRK_em1.pt', help='Path to the checkpoint')
     parser.add_argument('--crop', action='store_true', help='Crop the face using mediapipe')
     parser.add_argument('--out_path', type=str, default='output', help='Path to save the output (will be created if not exists)')
-    parser.add_argument('--use_smirk_generator', action='store_true', help='Use SMIRK neural image to image translator to reconstruct the image')
+    parser.add_argument('--use_smirk_generator', action='store_true',
+                        help='Run the SMIRK neural image translator. Its reconstruction is appended only in '
+                             'legacy layout; overlay layout still runs it but always displays its fixed three panels.')
     parser.add_argument('--render_orig', action='store_true', help='Present the result w.r.t. the original image/video size')
+    parser.add_argument('--visualization-layout', choices=['legacy', 'overlay'], default='legacy',
+                        help="Output composition: 'legacy' preserves the original SMIRK layout; 'overlay' emits "
+                             'original | cyan mesh overlay | isolated 3D render (default: legacy).')
+    parser.add_argument('--overlay-alpha', type=float, default=0.55,
+                        help='Mesh opacity in overlay layout, from 0 to 1 (default: 0.55).')
+    parser.add_argument('--overlay-color', type=int, nargs=3, metavar=('R', 'G', 'B'),
+                        default=(70, 190, 255),
+                        help='RGB mesh tint in overlay layout (default: 70 190 255).')
     parser.add_argument('--face-detection-mode', type=str, default='direct', choices=['direct', 'pose_roi'],
                          help="'direct' (default): run MediaPipe FaceLandmarker independently on every frame, as "
                               "in the original SMIRK release; a single frame with no detected face stops the demo. "
@@ -219,7 +271,9 @@ if __name__ == '__main__':
         out_width = input_image_size
         out_height = input_image_size
 
-    if args.use_smirk_generator:
+    if args.visualization_layout == 'overlay':
+        out_width *= 3
+    elif args.use_smirk_generator:
         out_width *= 3
     else:
         out_width *= 2
