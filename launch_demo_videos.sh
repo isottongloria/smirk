@@ -14,11 +14,12 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=results/logs/smirk_demo_%j.out
 #SBATCH --error=results/logs/smirk_demo_%j.err
-##SBATCH --account=<account_di_progetto>
-##SBATCH --partition=<partizione_gpu_leonardo>
+#SBATCH --account=IscrC_SLPSCALE
+#SBATCH --partition=boost_usr_prod
+#SBATCH --qos=boost_qos_lprod  
 
 set -Eeuo pipefail
 
@@ -36,8 +37,13 @@ VISUALIZATION_LAYOUT="overlay"
 OVERLAY_ALPHA="0.55"
 
 VIDEOS=(
-  "/leonardo_work/IscrC_SLPSCALE/RGB2SMPLX/rgb2smplx_test/input/CSY/front/100.MP4"
-  # "/percorso/secondo_video.MP4"
+"/leonardo_work/IscrC_SLPSCALE/smirk/samples/05May_2011_Thursday_tagesschau-26.mp4"
+"/leonardo_work/IscrC_SLPSCALE/smirk/samples/05May_2011_Thursday_tagesschau-27.mp4"
+"/leonardo_work/IscrC_SLPSCALE/RGB2SMPLX/rgb2smplx_test/input/CSY/front/0.MP4"
+"/leonardo_work/IscrC_SLPSCALE/RGB2SMPLX/rgb2smplx_test/input/CSY/front/100.MP4"
+"/leonardo_work/IscrC_SLPSCALE/RGB2SMPLX/rgb2smplx_test/input/CSY/front/3D.MP4"
+"/leonardo_work/IscrC_SLPSCALE/RGB2SMPLX/rgb2smplx_test/input/CSY/front/3.MP4"
+"/leonardo_work/IscrC_SLPSCALE/RGB2SMPLX/rgb2smplx_test/input/CSY/front/40.MP4"
 )
 
 fatal_missing=0
