@@ -22,7 +22,16 @@
 
 set -Eeuo pipefail
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# sbatch copia lo script nello spool di Slurm prima di eseguirlo: in quel caso
+# BASH_SOURCE punta a /var/spool/slurmd/job..., non al checkout di SMIRK.
+# SMIRK_ROOT resta sovrascrivibile per usare lo stesso launcher da altri checkout.
+SMIRK_ROOT="${SMIRK_ROOT:-/leonardo_work/IscrC_SLPSCALE/smirk}"
+if [[ ! -d "$SMIRK_ROOT" ]]; then
+  printf 'ERRORE: directory SMIRK mancante: %s\n' "$SMIRK_ROOT" >&2
+  printf '%s\n' 'Impostare SMIRK_ROOT al percorso assoluto del repository.' >&2
+  exit 1
+fi
+REPO_ROOT="$(cd -- "$SMIRK_ROOT" && pwd -P)"
 cd "$REPO_ROOT"
 
 # Facoltativo: percorso esplicito a conda.sh per i nodi non interattivi.
@@ -111,7 +120,7 @@ for index in "${!VIDEOS[@]}"; do
     "$video" "$video_output_dir" "$video_log"
 
   set +e
-  python -u demo_video.py \
+  python -u "$REPO_ROOT/demo_video.py" \
     --input_path "$video" \
     --out_path "$video_output_dir" \
     --checkpoint "$CHECKPOINT" \
